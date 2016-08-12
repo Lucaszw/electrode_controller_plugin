@@ -49,6 +49,15 @@ class ElectrodeControllerZmqPlugin(ZmqPlugin):
         self.control_board = None
         super(ElectrodeControllerZmqPlugin, self).__init__(*args, **kwargs)
 
+    def check_sockets(self):
+        try:
+            msg_frames = self.command_socket.recv_multipart(zmq.NOBLOCK)
+        except zmq.Again:
+            pass
+        else:
+            self.on_command_recv(msg_frames)
+        return True
+
     @property
     def electrode_states(self):
         # Set the state of DMF device channels.
@@ -180,7 +189,7 @@ class ElectrodeControllerPlugin(Plugin, AppDataController,
     def __init__(self):
         self.name = self.plugin_name
         self.plugin = None
-        self.command_timeout_id = None
+        self.plugin_timeout_id = None
 
     def get_schedule_requests(self, function_name):
         """
@@ -214,21 +223,12 @@ class ElectrodeControllerPlugin(Plugin, AppDataController,
         # Initialize sockets.
         self.plugin.reset()
 
-        def check_command_socket():
-            try:
-                msg_frames = (self.plugin.command_socket
-                              .recv_multipart(zmq.NOBLOCK))
-            except zmq.Again:
-                pass
-            else:
-                self.plugin.on_command_recv(msg_frames)
-            return True
-
-        self.command_timeout_id = gobject.timeout_add(10, check_command_socket)
+        self.plugin_timeout_id = gobject.timeout_add(10,
+                                                     self.plugin.check_sockets)
 
     def cleanup(self):
-        if self.command_timeout_id is not None:
-            gobject.source_remove(self.command_timeout_id)
+        if self.plugin_timeout_id is not None:
+            gobject.source_remove(self.plugin_timeout_id)
         if self.plugin is not None:
             self.plugin = None
 

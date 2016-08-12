@@ -1,13 +1,7 @@
-from datetime import datetime
-import logging
-
 from path_helpers import path
-from pip_helpers import install
+from microdrop_plugin_template import install_requirements
 
 
 if __name__ == '__main__':
-    logging.basicConfig(level=logging.INFO)
-    logging.info(str(datetime.now()))
-    requirements_file = path(__file__).parent.joinpath('requirements.txt')
-    if requirements_file.exists():
-        logging.info(install(['-r', requirements_file]))
+    plugin_root = path(__file__).parent.abspath()
+    install_requirements(plugin_root)
