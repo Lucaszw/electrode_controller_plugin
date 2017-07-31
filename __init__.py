@@ -18,14 +18,6 @@ along with electrode_controller_plugin.  If not, see <http://www.gnu.org/license
 """
 import logging
 
-from flatland import Form, String
-from microdrop.app_context import get_app
-from microdrop.plugin_helpers import (AppDataController, StepOptionsController,
-                                      get_plugin_info)
-from microdrop.plugin_manager import (PluginGlobals, Plugin, IPlugin,
-                                      ScheduleRequest, implements, emit_signal,
-                                      get_service_instance_by_name)
-from path_helpers import path
 from zmq_plugin.plugin import Plugin as ZmqPlugin
 from zmq_plugin.schema import decode_content_data
 import gobject
@@ -33,7 +25,28 @@ import gtk
 import pandas as pd
 import zmq
 
+from ...app_context import get_app, get_hub_uri
+from ...plugin_helpers import StepOptionsController
+from ...plugin_manager import (PluginGlobals, SingletonPlugin, IPlugin,
+                               implements, emit_signal)
+
 logger = logging.getLogger(__name__)
+
+def drop_duplicates_by_index(series):
+    '''
+    Drop all but first entry for each set of entries with the same index value.
+
+    Args:
+
+        series (pandas.Series) : Input series.
+
+    Returns:
+
+        (pandas.Series) : Input series with *first* value in `series` for each
+            *distinct* index value (i.e., duplicate entries dropped for same
+            index value).
+    '''
+    return series[~series.index.duplicated()]
 
 
 class ElectrodeControllerZmqPlugin(ZmqPlugin):
@@ -48,15 +61,6 @@ class ElectrodeControllerZmqPlugin(ZmqPlugin):
         self.parent = parent
         self.control_board = None
         super(ElectrodeControllerZmqPlugin, self).__init__(*args, **kwargs)
-
-    def check_sockets(self):
-        try:
-            msg_frames = self.command_socket.recv_multipart(zmq.NOBLOCK)
-        except zmq.Again:
-            pass
-        else:
-            self.on_command_recv(msg_frames)
-        return True
 
     @property
     def electrode_states(self):
@@ -81,11 +85,28 @@ class ElectrodeControllerZmqPlugin(ZmqPlugin):
     def get_state(self, electrode_states):
         app = get_app()
 
-        electrode_channels = (app.dmf_device.actuated_channels(electrode_states
-                                                               .index))
-        channel_states = pd.Series(electrode_states.values,
+        electrode_channels = (app.dmf_device
+                              .actuated_channels(electrode_states.index)
+                              .dropna().astype(int))
+
+        # Each channel should be represented *at most* once in
+        # `channel_states`.
+        channel_states = pd.Series(electrode_states
+                                   .ix[electrode_channels.index].values,
                                    index=electrode_channels)
-        return {'electrode_states': electrode_states,
+        # Duplicate entries may result from multiple electrodes mapped to the
+        # same channel or vice versa.
+        channel_states = drop_duplicates_by_index(channel_states)
+
+        channel_electrodes = (app.dmf_device.electrodes_by_channel
+                              .ix[channel_states.index])
+        electrode_states = pd.Series(channel_states
+                                     .ix[channel_electrodes.index].values,
+                                     index=channel_electrodes.values)
+
+        # Each electrode should be represented *at most* once in
+        # `electrode_states`.
+        return {'electrode_states': drop_duplicates_by_index(electrode_states),
                 'channel_states': channel_states}
 
     def get_channel_states(self):
@@ -111,7 +132,7 @@ class ElectrodeControllerZmqPlugin(ZmqPlugin):
         return self.set_electrode_states(pd.Series([state],
                                                    index=[electrode_id]))
 
-    def set_electrode_states(self, electrode_states):
+    def set_electrode_states(self, electrode_states, save=True):
         '''
         Set the state of multiple electrodes.
 
@@ -119,6 +140,7 @@ class ElectrodeControllerZmqPlugin(ZmqPlugin):
 
             electrode_states (pandas.Series) : State of electrodes, indexed by
                 electrode identifier (e.g., `"electrode001"`).
+            save (bool) : Trigger save request for protocol step.
 
         Returns:
 
@@ -127,16 +149,19 @@ class ElectrodeControllerZmqPlugin(ZmqPlugin):
         '''
         app = get_app()
 
+        result = self.get_state(electrode_states)
+
         # Set the state of DMF device channels.
-        self.electrode_states = (electrode_states
+        self.electrode_states = (result['electrode_states']
                                  .combine_first(self.electrode_states))
 
-        def notify(step_number):
-            emit_signal('on_step_options_changed', [self.name, step_number],
-                        interface=IPlugin)
-        gtk.idle_add(notify, app.protocol.current_step_number)
+        if save:
+            def notify(step_number):
+                emit_signal('on_step_options_changed', [self.name,
+                                                        step_number],
+                            interface=IPlugin)
+            gtk.idle_add(notify, app.protocol.current_step_number)
 
-        result = self.get_state(electrode_states)
         result['actuated_area'] = self.get_actuated_area(self.electrode_states)
         return result
 
@@ -147,59 +172,28 @@ class ElectrodeControllerZmqPlugin(ZmqPlugin):
     def on_execute__set_electrode_states(self, request):
         data = decode_content_data(request)
         try:
-            return self.set_electrode_states(data['electrode_states'])
+            return self.set_electrode_states(data['electrode_states'],
+                                             save=data.get('save', True))
         except:
             logger.error(str(data), exc_info=True)
 
     def on_execute__get_channel_states(self, request):
         return self.get_channel_states()
 
-PluginGlobals.push_env('microdrop.managed')
+PluginGlobals.push_env('microdrop')
 
 
-class ElectrodeControllerPlugin(Plugin, AppDataController,
-                                StepOptionsController):
+class ElectrodeControllerPlugin(SingletonPlugin, StepOptionsController):
     """
     This class is automatically registered with the PluginManager.
     """
     implements(IPlugin)
-    version = get_plugin_info(path(__file__).parent).version
-    plugin_name = get_plugin_info(path(__file__).parent).plugin_name
-
-    '''
-    AppFields
-    ---------
-
-    A flatland Form specifying application options for the current plugin.
-    Note that nested Form objects are not supported.
-
-    Since we subclassed AppDataController, an API is available to access and
-    modify these attributes.  This API also provides some nice features
-    automatically:
-        -all fields listed here will be included in the app options dialog
-            (unless properties=dict(show_in_gui=False) is used)
-        -the values of these fields will be stored persistently in the microdrop
-            config file, in a section named after this plugin's name attribute
-    '''
-    AppFields = Form.of(
-        String.named('hub_uri').using(optional=True,
-                                      default='tcp://localhost:31000'),
-    )
+    plugin_name = 'microdrop.electrode_controller_plugin'
 
     def __init__(self):
         self.name = self.plugin_name
         self.plugin = None
-        self.plugin_timeout_id = None
-
-    def get_schedule_requests(self, function_name):
-        """
-        Returns a list of scheduling requests (i.e., ScheduleRequest
-        instances) for the function specified by function_name.
-        """
-        if function_name == 'on_plugin_enable':
-            return [ScheduleRequest('wheelerlab.zmq_hub_plugin', self.name)]
-        else:
-            return []
+        self.command_timeout_id = None
 
     def on_plugin_enable(self):
         """
@@ -214,21 +208,27 @@ class ElectrodeControllerPlugin(Plugin, AppDataController,
 
         to retain this functionality.
         """
-        super(ElectrodeControllerPlugin, self).on_plugin_enable()
-        app_values = self.get_app_values()
-
         self.cleanup()
         self.plugin = ElectrodeControllerZmqPlugin(self, self.name,
-                                                   app_values['hub_uri'])
+                                                   get_hub_uri())
         # Initialize sockets.
         self.plugin.reset()
 
-        self.plugin_timeout_id = gobject.timeout_add(10,
-                                                     self.plugin.check_sockets)
+        def check_command_socket():
+            try:
+                msg_frames = (self.plugin.command_socket
+                              .recv_multipart(zmq.NOBLOCK))
+            except zmq.Again:
+                pass
+            else:
+                self.plugin.on_command_recv(msg_frames)
+            return True
+
+        self.command_timeout_id = gobject.timeout_add(10, check_command_socket)
 
     def cleanup(self):
-        if self.plugin_timeout_id is not None:
-            gobject.source_remove(self.plugin_timeout_id)
+        if self.command_timeout_id is not None:
+            gobject.source_remove(self.command_timeout_id)
         if self.plugin is not None:
             self.plugin = None
 
@@ -240,13 +240,13 @@ class ElectrodeControllerPlugin(Plugin, AppDataController,
 
     def on_app_exit(self):
         """
-        Handler called just before the Microdrop application exits.
+        Handler called just before the MicroDrop application exits.
         """
         self.cleanup()
 
     def on_step_swapped(self, old_step_number, step_number):
         if self.plugin is not None:
-            self.plugin.execute_async('wheelerlab.electrode_controller_plugin',
+            self.plugin.execute_async('microdrop.electrode_controller_plugin',
                                       'get_channel_states')
 
 
