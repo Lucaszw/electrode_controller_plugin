@@ -17,12 +17,15 @@ You should have received a copy of the GNU General Public License
 along with electrode_controller_plugin.  If not, see <http://www.gnu.org/licenses/>.
 """
 import logging
+import json
 
 from zmq_plugin.plugin import Plugin as ZmqPlugin
 from zmq_plugin.schema import decode_content_data
 import gobject
 import gtk
 import pandas as pd
+import paho_mqtt_helpers as pmh
+
 import zmq
 
 from ...app_context import get_app, get_hub_uri
@@ -48,31 +51,78 @@ def drop_duplicates_by_index(series):
     '''
     return series[~series.index.duplicated()]
 
+PluginGlobals.push_env('microdrop')
 
-class ElectrodeControllerZmqPlugin(ZmqPlugin):
-    '''
-    API for turning electrode(s) on/off.
 
-    Must handle:
-     - Updating state of hardware channels (if connected).
-     - Updating device user interface.
-    '''
-    def __init__(self, parent, *args, **kwargs):
-        self.parent = parent
-        self.control_board = None
-        super(ElectrodeControllerZmqPlugin, self).__init__(*args, **kwargs)
+class ElectrodeControllerPlugin(SingletonPlugin, StepOptionsController,
+                                pmh.BaseMqttReactor):
+    """
+    This class is automatically registered with the PluginManager.
+    """
+    implements(IPlugin)
+    plugin_name = 'microdrop.electrode_controller_plugin'
+
+    def __init__(self):
+        self.name = self.plugin_name
+        # self.plugin = None
+        self.command_timeout_id = None
+        pmh.BaseMqttReactor.__init__(self)
+        self.start()
+        self.mqtt_client.subscribe('microdrop/droplet-planning-plugin/'
+                                    'set-electrode-states')
+        self.mqtt_client.subscribe('microdrop/dmf-device-ui/'
+                                    'set-electrode-states')
+        # TODO: Possibly depricate set-electrode-state
+        self.mqtt_client.subscribe('microdrop/droplet-planning-plugin/'
+                                    'set-electrode-state')
+        self.mqtt_client.subscribe('microdrop/dmf-device-ui/'
+                                    'set-electrode-state')
+        self.mqtt_client.subscribe('microdrop/dmf-device-ui/get-channel-states')
 
     @property
     def electrode_states(self):
         # Set the state of DMF device channels.
-        step_options = self.parent.get_step_options()
+        step_options = self.get_step_options()
         return step_options.get('electrode_states', pd.Series())
 
     @electrode_states.setter
     def electrode_states(self, electrode_states):
         # Set the state of DMF device channels.
-        step_options = self.parent.get_step_options()
+        step_options = self.get_step_options()
         step_options['electrode_states'] = electrode_states
+
+    def on_message(self, client, userdata, msg):
+        '''
+        Callback for when a ``PUBLISH`` message is received from the broker.
+        '''
+        logger.info('[on_message] %s: "%s"', msg.topic, msg.payload)
+
+        if msg.topic == 'microdrop/droplet-planning-plugin/set-electrode-states':
+            self.set_electrode_states(json.loads(msg.payload))
+
+        if msg.topic == 'microdrop/dmf-device-ui/set-electrode-states':
+            self.set_electrode_states(json.loads(msg.payload))
+
+        if msg.topic == 'microdrop/dmf-device-ui/set-electrode-state':
+            self.set_electrode_state(json.loads(msg.payload))
+
+        if msg.topic == 'microdrop/dmf-device-ui/get-channel-states':
+            self.get_channel_states()
+
+    def on_plugin_enable(self):
+        """
+        Handler called once the plugin instance is enabled.
+
+        Note: if you inherit your plugin from AppDataController and don't
+        implement this handler, by default, it will automatically load all
+        app options from the config file. If you decide to overide the
+        default handler, you should call:
+
+            AppDataController.on_plugin_enable(self)
+
+        to retain this functionality.
+        """
+        pass
 
     def get_actuated_area(self, electrode_states):
         '''
@@ -81,6 +131,25 @@ class ElectrodeControllerZmqPlugin(ZmqPlugin):
         app = get_app()
         actuated_electrodes = electrode_states[electrode_states > 0].index
         return app.dmf_device.electrode_areas.ix[actuated_electrodes].sum()
+
+    def get_channel_states(self):
+        '''
+        Returns:
+
+            (pandas.Series) : State of channels, indexed by channel.
+        '''
+        result = self.get_state(self.electrode_states)
+        result['actuated_area'] = self.get_actuated_area(result
+                                                         ['electrode_states'])
+        data = {}
+        data['electrode_states'] = result['electrode_states'].to_json()
+        data['channel_states']   = result['channel_states'].to_json()
+        data['actuated_area']    = result['actuated_area']
+
+        self.mqtt_client.publish('microdrop/electrode-controller-plugin/'
+                                 'get-channel-states', json.dumps(data))
+
+        return result
 
     def get_state(self, electrode_states):
         app = get_app()
@@ -109,17 +178,6 @@ class ElectrodeControllerZmqPlugin(ZmqPlugin):
         return {'electrode_states': drop_duplicates_by_index(electrode_states),
                 'channel_states': channel_states}
 
-    def get_channel_states(self):
-        '''
-        Returns:
-
-            (pandas.Series) : State of channels, indexed by channel.
-        '''
-        result = self.get_state(self.electrode_states)
-        result['actuated_area'] = self.get_actuated_area(result
-                                                         ['electrode_states'])
-        return result
-
     def set_electrode_state(self, electrode_id, state):
         '''
         Set the state of a single electrode.
@@ -129,10 +187,12 @@ class ElectrodeControllerZmqPlugin(ZmqPlugin):
             electrode_id (str) : Electrode identifier (e.g., `"electrode001"`)
             state (int) : State of electrode
         '''
-        return self.set_electrode_states(pd.Series([state],
-                                                   index=[electrode_id]))
+        data = {}
+        data['electrode_states'] = pd.Series([state],
+                                        index=[electrode_id]).to_json()
+        return self.set_electrode_states(data)
 
-    def set_electrode_states(self, electrode_states, save=True):
+    def set_electrode_states(self, data):
         '''
         Set the state of multiple electrodes.
 
@@ -148,6 +208,11 @@ class ElectrodeControllerZmqPlugin(ZmqPlugin):
                 total area of all actuated electrodes.
         '''
         app = get_app()
+        electrode_states = pd.read_json(data['electrode_states'],typ='series',dtype=False)
+        if 'save' in data:
+            save = data['save']
+        else:
+            save = False
 
         result = self.get_state(electrode_states)
 
@@ -163,91 +228,28 @@ class ElectrodeControllerZmqPlugin(ZmqPlugin):
             gtk.idle_add(notify, app.protocol.current_step_number)
 
         result['actuated_area'] = self.get_actuated_area(self.electrode_states)
+
+        data = {}
+        data['electrode_states'] = self.electrode_states.to_json()
+        
+        self.mqtt_client.publish('microdrop/electrode-controller-plugin/'
+                                    'set-electrode-states', json.dumps(data))
+
         return result
-
-    def on_execute__set_electrode_state(self, request):
-        data = decode_content_data(request)
-        return self.set_electrode_state(data['electrode_id'], data['state'])
-
-    def on_execute__set_electrode_states(self, request):
-        data = decode_content_data(request)
-        try:
-            return self.set_electrode_states(data['electrode_states'],
-                                             save=data.get('save', True))
-        except:
-            logger.error(str(data), exc_info=True)
-
-    def on_execute__get_channel_states(self, request):
-        return self.get_channel_states()
-
-PluginGlobals.push_env('microdrop')
-
-
-class ElectrodeControllerPlugin(SingletonPlugin, StepOptionsController):
-    """
-    This class is automatically registered with the PluginManager.
-    """
-    implements(IPlugin)
-    plugin_name = 'microdrop.electrode_controller_plugin'
-
-    def __init__(self):
-        self.name = self.plugin_name
-        self.plugin = None
-        self.command_timeout_id = None
-
-    def on_plugin_enable(self):
-        """
-        Handler called once the plugin instance is enabled.
-
-        Note: if you inherit your plugin from AppDataController and don't
-        implement this handler, by default, it will automatically load all
-        app options from the config file. If you decide to overide the
-        default handler, you should call:
-
-            AppDataController.on_plugin_enable(self)
-
-        to retain this functionality.
-        """
-        self.cleanup()
-        self.plugin = ElectrodeControllerZmqPlugin(self, self.name,
-                                                   get_hub_uri())
-        # Initialize sockets.
-        self.plugin.reset()
-
-        def check_command_socket():
-            try:
-                msg_frames = (self.plugin.command_socket
-                              .recv_multipart(zmq.NOBLOCK))
-            except zmq.Again:
-                pass
-            else:
-                self.plugin.on_command_recv(msg_frames)
-            return True
-
-        self.command_timeout_id = gobject.timeout_add(10, check_command_socket)
-
-    def cleanup(self):
-        if self.command_timeout_id is not None:
-            gobject.source_remove(self.command_timeout_id)
-        if self.plugin is not None:
-            self.plugin = None
 
     def on_plugin_disable(self):
         """
         Handler called once the plugin instance is disabled.
         """
-        self.cleanup()
-
+        pass
     def on_app_exit(self):
         """
         Handler called just before the MicroDrop application exits.
         """
-        self.cleanup()
+        pass
 
     def on_step_swapped(self, old_step_number, step_number):
-        if self.plugin is not None:
-            self.plugin.execute_async('microdrop.electrode_controller_plugin',
-                                      'get_channel_states')
+        self.get_channel_states()
 
 
 PluginGlobals.pop_env()
