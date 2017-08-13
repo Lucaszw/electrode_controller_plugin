@@ -20,7 +20,7 @@ import logging
 import json
 
 from zmq_plugin.plugin import Plugin as ZmqPlugin
-from zmq_plugin.schema import decode_content_data
+from zmq_plugin.schema import decode_content_data, pandas_object_hook, PandasJsonEncoder
 import gobject
 import gtk
 import pandas as pd
@@ -68,15 +68,11 @@ class ElectrodeControllerPlugin(SingletonPlugin, StepOptionsController,
         self.command_timeout_id = None
         pmh.BaseMqttReactor.__init__(self)
         self.start()
-        self.mqtt_client.subscribe('microdrop/droplet-planning-plugin/'
-                                    'set-electrode-states')
-        self.mqtt_client.subscribe('microdrop/dmf-device-ui/'
-                                    'set-electrode-states')
+        self.mqtt_client.subscribe('microdrop/droplet-planning-plugin/set-electrode-states')
+        self.mqtt_client.subscribe('microdrop/dmf-device-ui/set-electrode-states')
         # TODO: Possibly depricate set-electrode-state
-        self.mqtt_client.subscribe('microdrop/droplet-planning-plugin/'
-                                    'set-electrode-state')
-        self.mqtt_client.subscribe('microdrop/dmf-device-ui/'
-                                    'set-electrode-state')
+        self.mqtt_client.subscribe('microdrop/droplet-planning-plugin/set-electrode-state')
+        self.mqtt_client.subscribe('microdrop/dmf-device-ui/set-electrode-state')
         self.mqtt_client.subscribe('microdrop/dmf-device-ui/get-channel-states')
 
     @property
@@ -98,10 +94,12 @@ class ElectrodeControllerPlugin(SingletonPlugin, StepOptionsController,
         logger.info('[on_message] %s: "%s"', msg.topic, msg.payload)
 
         if msg.topic == 'microdrop/droplet-planning-plugin/set-electrode-states':
-            self.set_electrode_states(json.loads(msg.payload))
+            data = json.loads(msg.payload, object_hook=pandas_object_hook)
+            self.set_electrode_states(data)
 
         if msg.topic == 'microdrop/dmf-device-ui/set-electrode-states':
-            self.set_electrode_states(json.loads(msg.payload))
+            data = json.loads(msg.payload, object_hook=pandas_object_hook)
+            self.set_electrode_states(data)
 
         if msg.topic == 'microdrop/dmf-device-ui/set-electrode-state':
             self.set_electrode_state(json.loads(msg.payload))
@@ -142,18 +140,18 @@ class ElectrodeControllerPlugin(SingletonPlugin, StepOptionsController,
         result['actuated_area'] = self.get_actuated_area(result
                                                          ['electrode_states'])
         data = {}
-        data['electrode_states'] = result['electrode_states'].to_json()
-        data['channel_states']   = result['channel_states'].to_json()
+        data['electrode_states'] = result['electrode_states']
+        data['channel_states']   = result['channel_states']
         data['actuated_area']    = result['actuated_area']
 
-        self.mqtt_client.publish('microdrop/electrode-controller-plugin/'
-                                 'get-channel-states', json.dumps(data))
+        self.mqtt_client.publish('microdrop/electrode-controller-plugin/get-channel-states',
+                                  json.dumps(data, cls=PandasJsonEncoder),
+                                  retain=True)
 
         return result
 
     def get_state(self, electrode_states):
         app = get_app()
-
         electrode_channels = (app.dmf_device
                               .actuated_channels(electrode_states.index)
                               .dropna().astype(int))
@@ -178,7 +176,7 @@ class ElectrodeControllerPlugin(SingletonPlugin, StepOptionsController,
         return {'electrode_states': drop_duplicates_by_index(electrode_states),
                 'channel_states': channel_states}
 
-    def set_electrode_state(self, electrode_id, state):
+    def set_electrode_state(self, msg):
         '''
         Set the state of a single electrode.
 
@@ -188,8 +186,8 @@ class ElectrodeControllerPlugin(SingletonPlugin, StepOptionsController,
             state (int) : State of electrode
         '''
         data = {}
-        data['electrode_states'] = pd.Series([state],
-                                        index=[electrode_id]).to_json()
+        data['electrode_states'] = pd.Series([msg['state']],
+                                        index=[msg['electrode_id']])
         return self.set_electrode_states(data)
 
     def set_electrode_states(self, data):
@@ -208,7 +206,9 @@ class ElectrodeControllerPlugin(SingletonPlugin, StepOptionsController,
                 total area of all actuated electrodes.
         '''
         app = get_app()
-        electrode_states = pd.read_json(data['electrode_states'],typ='series',dtype=False)
+
+        electrode_states = data['electrode_states']
+
         if 'save' in data:
             save = data['save']
         else:
@@ -230,10 +230,11 @@ class ElectrodeControllerPlugin(SingletonPlugin, StepOptionsController,
         result['actuated_area'] = self.get_actuated_area(self.electrode_states)
 
         data = {}
-        data['electrode_states'] = self.electrode_states.to_json()
-        
-        self.mqtt_client.publish('microdrop/electrode-controller-plugin/'
-                                    'set-electrode-states', json.dumps(data))
+        data['electrode_states'] = self.electrode_states
+
+        self.mqtt_client.publish('microdrop/electrode-controller-plugin/set-electrode-states',
+                                  json.dumps(data,cls=PandasJsonEncoder),
+                                  retain=True)
 
         return result
 
