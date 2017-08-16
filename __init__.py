@@ -68,12 +68,6 @@ class ElectrodeControllerPlugin(SingletonPlugin, StepOptionsController,
         self.command_timeout_id = None
         pmh.BaseMqttReactor.__init__(self)
         self.start()
-        self.mqtt_client.subscribe('microdrop/droplet-planning-plugin/set-electrode-states')
-        self.mqtt_client.subscribe('microdrop/dmf-device-ui/set-electrode-states')
-        # TODO: Possibly depricate set-electrode-state
-        self.mqtt_client.subscribe('microdrop/droplet-planning-plugin/set-electrode-state')
-        self.mqtt_client.subscribe('microdrop/dmf-device-ui/set-electrode-state')
-        self.mqtt_client.subscribe('microdrop/dmf-device-ui/get-channel-states')
 
     @property
     def electrode_states(self):
@@ -86,6 +80,14 @@ class ElectrodeControllerPlugin(SingletonPlugin, StepOptionsController,
         # Set the state of DMF device channels.
         step_options = self.get_step_options()
         step_options['electrode_states'] = electrode_states
+
+    def on_connect(self, client, userdata, flags, rc):
+        self.mqtt_client.subscribe('microdrop/droplet-planning-plugin/set-electrode-states')
+        self.mqtt_client.subscribe('microdrop/dmf-device-ui/set-electrode-states')
+        # TODO: Possibly depricate set-electrode-state
+        self.mqtt_client.subscribe('microdrop/droplet-planning-plugin/set-electrode-state')
+        self.mqtt_client.subscribe('microdrop/dmf-device-ui/set-electrode-state')
+        self.mqtt_client.subscribe('microdrop/dmf-device-ui/get-channel-states')
 
     def on_message(self, client, userdata, msg):
         '''
